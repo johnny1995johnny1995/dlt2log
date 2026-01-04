@@ -1,0 +1,17 @@
+[package]
+name = "dlt2log"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yang Zhewei"]
+description = "A tool to convert DLT binary files to human-readable log formats"
+
+[dependencies]
+dlt-core = "0.20.1"
+clap = { version = "4.4", features = ["derive"] }
+anyhow = "1.0"
+chrono = "0.4"
+pathdiff = "0.2"
+
+[dev-dependencies]
+assert_fs = "1.0"
+predicates = "3.0"
