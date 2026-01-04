@@ -15,6 +15,33 @@
 
 需要安裝 [Rust](https://www.rust-lang.org/tools/install)。
 
+## 安裝方式 (Installation)
+
+你可以透過以下幾種方式安裝此工具，方便在任何路徑下使用：
+
+### 1. 本地安裝 (推薦)
+
+如果你有源代碼，可以直接將其安裝到 Cargo 的 bin 目錄下（通常在 PATH 中）：
+
+```bash
+cargo install --path .
+```
+
+安裝後，你就可以在任何地方直接執行：
+
+```bash
+dlt2log <input_file.dlt>
+```
+
+### 2. 使用執行檔 (Binary)
+
+執行 `make build` 後，執行檔會位於 `target/release/dlt2log`。
+你可以將此檔案複製到 `/usr/local/bin` 或其他 PATH 路徑中：
+
+```bash
+cp target/release/dlt2log /usr/local/bin/
+```
+
 ### 快速開始 (Quick Start)
 
 對於新的開發環境，你可以使用以下腳本快速設定：
