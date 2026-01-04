@@ -15,6 +15,22 @@
 
 需要安裝 [Rust](https://www.rust-lang.org/tools/install)。
 
+### 快速開始 (Quick Start)
+
+對於新的開發環境，你可以使用以下腳本快速設定：
+
+```bash
+./setup.sh
+```
+
+或者使用 Make 指令：
+
+```bash
+make build   # 編譯
+make verify  # 執行全檔案驗證
+make clean   # 清除 log 與編譯檔
+```
+
 ### 基本轉換
 
 ```bash

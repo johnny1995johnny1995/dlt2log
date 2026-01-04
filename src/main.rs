@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
@@ -26,84 +25,96 @@ enum DltVersion {
     V2,
 }
 
-fn read_v1v2_message<R: Read + Seek>(
+/// Helper to clean payload string by keeping only meaningful printable ASCII sequences.
+fn clean_payload(buf: &[u8]) -> String {
+    let mut payload = String::new();
+    let mut current_segment = String::new();
+
+    for &b in buf {
+        if b >= 32 && b <= 126 {
+            current_segment.push(b as char);
+        } else {
+            // Start of non-printable section, flush current segment if valid
+            if current_segment.len() >= 2 {
+                if !payload.is_empty() {
+                    payload.push(' ');
+                }
+                payload.push_str(&current_segment);
+            }
+            current_segment.clear();
+        }
+    }
+    // Flush last segment
+    if current_segment.len() >= 2 {
+        if !payload.is_empty() {
+            payload.push(' ');
+        }
+        payload.push_str(&current_segment);
+    }
+    
+    payload
+}
+
+/// Reads and parses the DLT storage header if present, returning the timestamp in microseconds.
+fn read_storage_header<R: Read + Seek>(reader: &mut R, has_storage_header: bool) -> Result<u64> {
+     if !has_storage_header {
+        return Ok(0);
+    }
+
+    // We assume DLT\x01 format for now which is common for Vector
+    let mut magic = [0u8; 4];
+    if reader.read_exact(&mut magic).is_err() {
+        return Ok(0); 
+    }
+    if &magic != b"DLT\x01" {
+        return Ok(0); // Desynced or not a storage header
+    }
+    
+    // Read seconds and microseconds/nanoseconds
+    let mut sec_bytes = [0u8; 4];
+    let mut extra_bytes = [0u8; 4];
+    reader.read_exact(&mut sec_bytes)?;
+    reader.read_exact(&mut extra_bytes)?;
+    let sec = u32::from_le_bytes(sec_bytes);
+    let extra = u32::from_le_bytes(extra_bytes);
+    
+    // Skip ECU ID in storage header (4 bytes)
+    let mut ecu = [0u8; 4];
+    reader.read_exact(&mut ecu)?;
+
+    Ok((sec as u64 * 1_000_000) + (extra as u64))
+}
+
+fn parse_v1_message<R: Read + Seek>(
     reader: &mut R,
-    has_storage_header: bool,
+    htyp: u8,
+    storage_header_timestamp: u64
 ) -> Result<Option<String>> {
-    let mut storage_header_timestamp: u64 = 0;
+    // Handle V1 header manually to avoid DltMessageReader buffering the whole file
+    let mut rest_header = [0u8; 3]; // mcnt + len(2)
+    reader.read_exact(&mut rest_header)?;
     
-    if has_storage_header {
-        // We assume DLT\x01 format for now which is common for Vector
-        // But we need to handle DLTv2 storage header if it's different
-        let mut magic = [0u8; 4];
-        if reader.read_exact(&mut magic).is_err() {
+    let total_len = u16::from_be_bytes([rest_header[1], rest_header[2]]) as usize;
+    
+    if total_len < 4 {
             return Ok(None);
-        }
-        if &magic != b"DLT\x01" {
-            // Desynced or not a storage header
-            return Ok(None);
-        }
-        
-        // Read seconds and microseconds/nanoseconds
-        // Vector Storage Header: 4 bytes sec, 4 bytes us
-        let mut sec_bytes = [0u8; 4];
-        let mut extra_bytes = [0u8; 4];
-        reader.read_exact(&mut sec_bytes)?;
-        reader.read_exact(&mut extra_bytes)?;
-        let sec = u32::from_le_bytes(sec_bytes);
-        let extra = u32::from_le_bytes(extra_bytes);
-        
-        // Skip ECU ID in storage header (4 bytes)
-        let mut ecu = [0u8; 4];
-        reader.read_exact(&mut ecu)?;
-
-        storage_header_timestamp = (sec as u64 * 1_000_000) + (extra as u64);
-    }
-
-    // Now at the start of DLT message
-    let mut htyp = [0u8; 1];
-    if reader.read_exact(&mut htyp).is_err() {
-        return Ok(None);
     }
     
-    let version = if htyp[0] == 0x35 {
-        DltVersion::V1
-    } else if htyp[0] == 0x4c {
-        DltVersion::V2
-    } else {
-        // Try to find sync? For now just return
-        return Err(anyhow::anyhow!("Unknown DLT version marker: 0x{:02x}", htyp[0]));
-    };
-
-    if version == DltVersion::V1 {
-        // Handle V1 header manually to avoid DltMessageReader buffering the whole file
-        let mut rest_header = [0u8; 3]; // mcnt + len(2)
-        reader.read_exact(&mut rest_header)?;
-        
-        let total_len = u16::from_be_bytes([rest_header[1], rest_header[2]]) as usize;
-        
-        // We have read 1 (htyp) + 3 (rest) = 4 bytes
-        // Need to read total_len - 4 more
-        if total_len < 4 {
-             // Invalid length, try to skip? or just return None
-             return Ok(None);
-        }
-        
-        let mut msg_buf = vec![0u8; total_len];
-        msg_buf[0] = htyp[0];
-        msg_buf[1..4].copy_from_slice(&rest_header);
-        
-        reader.read_exact(&mut msg_buf[4..])?;
-        
-        // Now parse the isolated buffer
-        match dlt_core::parse::dlt_message(&msg_buf[..], None, false) {
-            Ok((_, parsed_msg)) => {
-                if let dlt_core::parse::ParsedMessage::Item(msg) = parsed_msg {
-                    let timestamp = if storage_header_timestamp > 0 {
-                        storage_header_timestamp
-                    } else {
-                        msg.header.timestamp.unwrap_or(0) as u64 * 100
-                    };
+    let mut msg_buf = vec![0u8; total_len];
+    msg_buf[0] = htyp;
+    msg_buf[1..4].copy_from_slice(&rest_header);
+    
+    reader.read_exact(&mut msg_buf[4..])?;
+    
+    // Now parse the isolated buffer
+    match dlt_core::parse::dlt_message(&msg_buf[..], None, false) {
+        Ok((_, parsed_msg)) => {
+            if let dlt_core::parse::ParsedMessage::Item(msg) = parsed_msg {
+                let timestamp = if storage_header_timestamp > 0 {
+                    storage_header_timestamp
+                } else {
+                    msg.header.timestamp.unwrap_or(0) as u64 * 100
+                };
 
                 let (app_id, ctx_id, log_level) = if let Some(eh) = &msg.extended_header {
                     let apid = eh.application_id.as_str().to_string();
@@ -129,136 +140,138 @@ fn read_v1v2_message<R: Read + Seek>(
                 };
 
                 return Ok(Some(format!("[{}][{} {}][{}] {}", timestamp, app_id, ctx_id, log_level, payload)));
-                } // End if let Item(msg)
-                return Ok(None); // Should include other variants? Control/Item? Usually just Item.
-            }
-            Err(_) => {
-                // If parsing fails, maybe just return raw bytes or error
-                return Err(anyhow::anyhow!("Failed to parse DLT v1 message"));
-            }
+            } 
+            return Ok(None); 
         }
-    } else if version == DltVersion::V2 {
-        // Manual v2 parsing based on dlt-viewer dlt_common.c
-        let mut htyp2_rest = [0u8; 3];
-        reader.read_exact(&mut htyp2_rest)?;
-        let htyp2 = (htyp[0] as u32) | ((htyp2_rest[0] as u32) << 8) | ((htyp2_rest[1] as u32) << 16) | ((htyp2_rest[2] as u32) << 24);
-        
-        let mut mcnt = [0u8; 1];
-        reader.read_exact(&mut mcnt)?;
-        
-        let mut len_bytes = [0u8; 2];
-        reader.read_exact(&mut len_bytes)?;
-        let total_len = u16::from_be_bytes(len_bytes) as usize; // Big Endian length
-        
-        let mut consumed = 7; 
-        let mut v2_timestamp: u64 = 0;
-
-        let cnti = htyp2 & 0x03;
-        
-        // Optional Header: MSIN + NOAR (2, if CNTI 0 or 2) + TMSP2 (9, if CNTI 0 or 1)
-        if cnti == 0 || cnti == 2 {
-            let mut msin_noar = [0u8; 2];
-            reader.read_exact(&mut msin_noar)?;
-            consumed += 2;
-        }
-        if cnti == 0 || cnti == 1 {
-            // Observed in log_166.dlt: 8 bytes timestamp + 1 mysterious byte?
-            // Actually dlt_common.c says headersize=headersize+9.
-            let mut tmsp_bytes = [0u8; 8];
-            reader.read_exact(&mut tmsp_bytes)?;
-            let mut mystery = [0u8; 1];
-            reader.read_exact(&mut mystery)?;
-            v2_timestamp = u64::from_le_bytes(tmsp_bytes);
-            if v2_timestamp > 2_000_000_000_000_000 { // Large ns?
-                v2_timestamp /= 1000;
-            }
-            consumed += 9;
-        }
-
-        let timestamp = if storage_header_timestamp > 0 {
-            storage_header_timestamp
-        } else {
-            v2_timestamp
-        };
-
-        // Bit 2: ECU ID
-        if (htyp2 & 0x04) != 0 {
-            let mut len = [0u8; 1];
-            reader.read_exact(&mut len)?;
-            let mut buf = vec![0u8; len[0] as usize];
-            reader.read_exact(&mut buf)?;
-            consumed += 1 + len[0] as usize;
-        }
-        
-        let mut apid = "----".to_string();
-        let mut ctid = "----".to_string();
-        
-        // Bit 3: AppID / CtxID
-        if (htyp2 & 0x08) != 0 {
-            // AppID
-            let mut len = [0u8; 1];
-            reader.read_exact(&mut len)?;
-            let mut buf = vec![0u8; len[0] as usize];
-            reader.read_exact(&mut buf)?;
-            apid = String::from_utf8_lossy(&buf).to_string();
-            consumed += 1 + len[0] as usize;
-            
-            // CtxID
-            let mut len = [0u8; 1];
-            reader.read_exact(&mut len)?;
-            let mut buf = vec![0u8; len[0] as usize];
-            reader.read_exact(&mut buf)?;
-            ctid = String::from_utf8_lossy(&buf).to_string();
-            consumed += 1 + len[0] as usize;
-        }
-
-        // Bit 4: Session ID
-        if (htyp2 & 0x10) != 0 {
-            let mut sid = [0u8; 4];
-            reader.read_exact(&mut sid)?;
-            consumed += 4;
-        }
-
-        // Consume remaining bytes to reach total_len
-        if total_len > consumed {
-            let rem = total_len - consumed;
-            let mut buf = vec![0u8; rem];
-            reader.read_exact(&mut buf)?;
-            
-            // Heuristic payload extraction: keep only meaningful printable ASCII sequences
-            // This filters out DLT Type Info (4 bytes) and Length (2 bytes) fields which are mostly binary
-            let mut payload = String::new();
-            let mut current_segment = String::new();
-            
-            for &b in &buf {
-                if b >= 32 && b <= 126 {
-                    current_segment.push(b as char);
-                } else {
-                    // Start of non-printable section, flush current segment if valid
-                    if current_segment.len() >= 2 {
-                        if !payload.is_empty() {
-                            payload.push(' ');
-                        }
-                        payload.push_str(&current_segment);
-                    }
-                    current_segment.clear();
-                }
-            }
-            // Flush last segment
-            if current_segment.len() >= 2 {
-                if !payload.is_empty() {
-                    payload.push(' ');
-                }
-                payload.push_str(&current_segment);
-            }
-            
-            return Ok(Some(format!("[{}][{} {}][INFO] {}", timestamp, apid, ctid, payload)));
-        } else {
-            return Ok(Some(format!("[{}][{} {}][INFO] <No Payload>", timestamp, apid, ctid)));
+        Err(_) => {
+            return Err(anyhow::anyhow!("Failed to parse DLT v1 message"));
         }
     }
+}
 
-    Ok(None)
+fn parse_v2_message<R: Read + Seek>(
+    reader: &mut R,
+    htyp: u8,
+    storage_header_timestamp: u64
+) -> Result<Option<String>> {
+    let mut htyp2_rest = [0u8; 3];
+    reader.read_exact(&mut htyp2_rest)?;
+    let htyp2 = (htyp as u32) | ((htyp2_rest[0] as u32) << 8) | ((htyp2_rest[1] as u32) << 16) | ((htyp2_rest[2] as u32) << 24);
+    
+    let mut mcnt = [0u8; 1];
+    reader.read_exact(&mut mcnt)?;
+    
+    let mut len_bytes = [0u8; 2];
+    reader.read_exact(&mut len_bytes)?;
+    let total_len = u16::from_be_bytes(len_bytes) as usize; // Big Endian length
+    
+    let mut consumed = 7; 
+    let mut v2_timestamp: u64 = 0;
+
+    let cnti = htyp2 & 0x03;
+    
+    // Optional Header: MSIN + NOAR (2, if CNTI 0 or 2) + TMSP2 (9, if CNTI 0 or 1)
+    if cnti == 0 || cnti == 2 {
+        let mut msin_noar = [0u8; 2];
+        reader.read_exact(&mut msin_noar)?;
+        consumed += 2;
+    }
+    if cnti == 0 || cnti == 1 {
+        let mut tmsp_bytes = [0u8; 8];
+        reader.read_exact(&mut tmsp_bytes)?;
+        let mut mystery = [0u8; 1];
+        reader.read_exact(&mut mystery)?;
+        v2_timestamp = u64::from_le_bytes(tmsp_bytes);
+        if v2_timestamp > 2_000_000_000_000_000 { 
+            v2_timestamp /= 1000;
+        }
+        consumed += 9;
+    }
+
+    let timestamp = if storage_header_timestamp > 0 {
+        storage_header_timestamp
+    } else {
+        v2_timestamp
+    };
+
+    // Bit 2: ECU ID
+    if (htyp2 & 0x04) != 0 {
+        let mut len = [0u8; 1];
+        reader.read_exact(&mut len)?;
+        let mut buf = vec![0u8; len[0] as usize];
+        reader.read_exact(&mut buf)?;
+        consumed += 1 + len[0] as usize;
+    }
+    
+    let mut apid = "----".to_string();
+    let mut ctid = "----".to_string();
+    
+    // Bit 3: AppID / CtxID
+    if (htyp2 & 0x08) != 0 {
+        // AppID
+        let mut len = [0u8; 1];
+        reader.read_exact(&mut len)?;
+        let mut buf = vec![0u8; len[0] as usize];
+        reader.read_exact(&mut buf)?;
+        apid = String::from_utf8_lossy(&buf).to_string();
+        consumed += 1 + len[0] as usize;
+        
+        // CtxID
+        let mut len = [0u8; 1];
+        reader.read_exact(&mut len)?;
+        let mut buf = vec![0u8; len[0] as usize];
+        reader.read_exact(&mut buf)?;
+        ctid = String::from_utf8_lossy(&buf).to_string();
+        consumed += 1 + len[0] as usize;
+    }
+
+    // Bit 4: Session ID
+    if (htyp2 & 0x10) != 0 {
+        let mut sid = [0u8; 4];
+        reader.read_exact(&mut sid)?;
+        consumed += 4;
+    }
+
+    // Consume remaining bytes to reach total_len
+    if total_len > consumed {
+        let rem = total_len - consumed;
+        let mut buf = vec![0u8; rem];
+        reader.read_exact(&mut buf)?;
+        
+        // Heuristic payload extraction
+        let payload = clean_payload(&buf);
+        
+        return Ok(Some(format!("[{}][{} {}][INFO] {}", timestamp, apid, ctid, payload)));
+    } else {
+        return Ok(Some(format!("[{}][{} {}][INFO] <No Payload>", timestamp, apid, ctid)));
+    }
+}
+
+fn read_v1v2_message<R: Read + Seek>(
+    reader: &mut R,
+    has_storage_header: bool,
+) -> Result<Option<String>> {
+    let storage_header_timestamp = read_storage_header(reader, has_storage_header)?;
+
+    // Now at the start of DLT message
+    let mut htyp = [0u8; 1];
+    if reader.read_exact(&mut htyp).is_err() {
+        return Ok(None);
+    }
+    
+    let version = if htyp[0] == 0x35 {
+        DltVersion::V1
+    } else if htyp[0] == 0x4c {
+        DltVersion::V2
+    } else {
+        // Try to find sync? For now just return
+        return Err(anyhow::anyhow!("Unknown DLT version marker: 0x{:02x}", htyp[0]));
+    };
+
+    match version {
+        DltVersion::V1 => parse_v1_message(reader, htyp[0], storage_header_timestamp),
+        DltVersion::V2 => parse_v2_message(reader, htyp[0], storage_header_timestamp),
+    }
 }
 
 fn main() -> Result<()> {
