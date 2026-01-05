@@ -3,7 +3,22 @@ name = "dlt2log"
 version = "0.1.0"
 edition = "2021"
 authors = ["Yang Zhewei"]
+license = "MIT"
+readme = "README.md"
 description = "A tool to convert DLT binary files to human-readable log formats"
+keywords = ["dlt", "automotive", "log", "parser"]
+exclude = [
+    "dlt_v1_v2/*",
+    "*.log",
+    "*.sh",
+    "Makefile",
+    "plan.md",
+    "verification_steps.md",
+    "PUBLISHING.md",
+    ".gitignore",
+    ".vscode/*"
+]
+categories = ["command-line-utilities", "development-tools::debugging"]
 
 [dependencies]
 dlt-core = "0.20.1"
