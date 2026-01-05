@@ -173,7 +173,7 @@ done
 
 ### Phase 2: 發佈與維護 📦
 
-- [ ] 註冊 Crates.io 帳號並執行 `cargo publish`
+- [x] 註冊 Crates.io 帳號並執行 `cargo publish`
 - [ ] 建立 GitHub Release 與 CI/CD 自動化
 
 ### Phase 3: 進階功能 🚀
