@@ -55,6 +55,16 @@ cargo install dlt2log
 
 ## 輸出格式
 
+輸出符合以下格式：
+`[timestamp][AppID ContextID][LogLevel] payload`
+
+*   **timestamp**: 統一為 **16 位數微秒 (Microseconds)**，對齊 `dlt-viewer` 與 `example.log`。
+    *   **DLT v1**: 單位為 100us，程式會自動縮放並補齊。
+    *   **DLT v2 (TMSP2)**: 支援高精度奈秒 (ns) 或 100ns 單位。程式會自動偵測單位並縮放至 16 位數微秒，解決 V2 原始數據位數過長的問題。
+    *   **時間基準**:
+        *   若 DLT 檔案包含 Storage Header，則使用絕對時間。
+        *   若為純 DLT 流 (如 V1)，程式會自動讀取檔案修改時間作為基準，將相對時間補排為絕對時間。
+
 工具會將日誌轉換為以下格式：
 
 ```text

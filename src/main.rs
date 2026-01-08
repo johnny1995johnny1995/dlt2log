@@ -110,11 +110,18 @@ fn parse_v1_message<R: Read + Seek>(
     match dlt_core::parse::dlt_message(&msg_buf[..], None, false) {
         Ok((_, parsed_msg)) => {
             if let dlt_core::parse::ParsedMessage::Item(msg) = parsed_msg {
-                let timestamp = if storage_header_timestamp > 0 {
+                let mut timestamp = if storage_header_timestamp > 0 {
                     storage_header_timestamp
                 } else {
+                    // Fallback: Using relative timestamp from message (usually 0.1ms units in V1)
+                    // We will add the base_timestamp (mtime) in main loop if needed
                     msg.header.timestamp.unwrap_or(0) as u64 * 100
                 };
+
+                // Standardize to 16 digits (microseconds)
+                while timestamp > 9_999_999_999_999_999 {
+                    timestamp /= 10;
+                }
 
                 let (app_id, ctx_id, log_level) = if let Some(eh) = &msg.extended_header {
                     let apid = eh.application_id.as_str().to_string();
@@ -139,7 +146,7 @@ fn parse_v1_message<R: Read + Seek>(
                     _ => format!("{:?}", msg.payload),
                 };
 
-                return Ok(Some(format!("[{}][{} {}][{}] {}", timestamp, app_id, ctx_id, log_level, payload)));
+                return Ok(Some(format!("[{:016}][{} {}][{}] {}", timestamp, app_id, ctx_id, log_level, payload)));
             } 
             return Ok(None); 
         }
@@ -182,9 +189,12 @@ fn parse_v2_message<R: Read + Seek>(
         let mut mystery = [0u8; 1];
         reader.read_exact(&mut mystery)?;
         v2_timestamp = u64::from_le_bytes(tmsp_bytes);
-        if v2_timestamp > 2_000_000_000_000_000 { 
-            v2_timestamp /= 1000;
+        
+        // Standardize to 16 digits (microseconds)
+        while v2_timestamp > 9_999_999_999_999_999 {
+            v2_timestamp /= 10;
         }
+        
         consumed += 9;
     }
 
@@ -241,15 +251,16 @@ fn parse_v2_message<R: Read + Seek>(
         // Heuristic payload extraction
         let payload = clean_payload(&buf);
         
-        return Ok(Some(format!("[{}][{} {}][INFO] {}", timestamp, apid, ctid, payload)));
+        return Ok(Some(format!("[{:016}][{} {}][INFO] {}", timestamp, apid, ctid, payload)));
     } else {
-        return Ok(Some(format!("[{}][{} {}][INFO] <No Payload>", timestamp, apid, ctid)));
+        return Ok(Some(format!("[{:016}][{} {}][INFO] <No Payload>", timestamp, apid, ctid)));
     }
 }
 
 fn read_v1v2_message<R: Read + Seek>(
     reader: &mut R,
     has_storage_header: bool,
+    base_timestamp: u64,
 ) -> Result<Option<String>> {
     let storage_header_timestamp = read_storage_header(reader, has_storage_header)?;
 
@@ -264,14 +275,43 @@ fn read_v1v2_message<R: Read + Seek>(
     } else if htyp[0] == 0x4c {
         DltVersion::V2
     } else {
-        // Try to find sync? For now just return
         return Err(anyhow::anyhow!("Unknown DLT version marker: 0x{:02x}", htyp[0]));
     };
 
-    match version {
-        DltVersion::V1 => parse_v1_message(reader, htyp[0], storage_header_timestamp),
-        DltVersion::V2 => parse_v2_message(reader, htyp[0], storage_header_timestamp),
+    let result = match version {
+        DltVersion::V1 => parse_v1_message(reader, htyp[0], storage_header_timestamp)?,
+        DltVersion::V2 => parse_v2_message(reader, htyp[0], storage_header_timestamp)?,
+    };
+
+    if let Some(mut line) = result {
+        // If the timestamp is relative (less than a threshold, e.g., 50 years in us)
+        // AND we have a base_timestamp, anchor it.
+        if let Some(start_idx) = line.find('[') {
+            if let Some(end_idx) = line.find(']') {
+                let ts_str = &line[start_idx+1..end_idx];
+                if let Ok(ts_val) = ts_str.parse::<u64>() {
+                    // If timestamp is small (e.g. < 10^12 us, which is ~11 days)
+                    // it's almost certainly relative to boot.
+                    if ts_val < 1_000_000_000_000 && base_timestamp > 0 {
+                        let mut absolute_ts = base_timestamp + ts_val;
+                        while absolute_ts > 9_999_999_999_999_999 {
+                             absolute_ts /= 10;
+                        }
+                        line = format!("[{:016}]{}", absolute_ts, &line[end_idx+1..]);
+                    } else {
+                        let mut absolute_ts = ts_val;
+                        while absolute_ts > 9_999_999_999_999_999 {
+                             absolute_ts /= 10;
+                        }
+                        line = format!("[{:016}]{}", absolute_ts, &line[end_idx+1..]);
+                    }
+                }
+            }
+        }
+        return Ok(Some(line));
     }
+    
+    Ok(None)
 }
 
 fn main() -> Result<()> {
@@ -287,6 +327,12 @@ fn main() -> Result<()> {
     };
 
     let mut input_file = File::open(&args.input)?;
+    
+    // Get file modification time as base for relative timestamps
+    let metadata = input_file.metadata()?;
+    let mtime = metadata.modified()?;
+    let base_timestamp = mtime.duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
+
     let mut header_magic = [0u8; 4];
     let has_storage_header = if input_file.read_exact(&mut header_magic).is_ok() {
         let found = &header_magic == b"DLT\x01";
@@ -302,7 +348,7 @@ fn main() -> Result<()> {
 
     loop {
         let pos_before = input_file.stream_position()?;
-        match read_v1v2_message(&mut input_file, has_storage_header) {
+        match read_v1v2_message(&mut input_file, has_storage_header, base_timestamp) {
             Ok(Some(line)) => {
                 let pos_after = input_file.stream_position()?;
                 if args.verbose {
